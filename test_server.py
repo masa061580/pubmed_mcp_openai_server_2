@@ -49,23 +49,64 @@ async def test_search(client: PubMedClient, query: str = "COVID-19 AND vaccine",
         return []
 
 
-async def test_fetch(client: PubMedClient, pmids: List[str]):
-    """Test the fetch functionality (abstract retrieval)"""
+async def test_fetch_single(client: PubMedClient, pmids: List[str]):
+    """Test the fetch functionality for single PMID (OpenAI MCP compliant)"""
     if not pmids:
-        print("\n⚠️  No PMIDs available for abstract testing")
+        print("\n⚠️  No PMIDs available for single fetch testing")
+        return None
+    
+    # Test with first PMID only
+    test_pmid = pmids[0]
+    
+    print(f"\n{'='*60}")
+    print(f"TESTING FETCH (Single PMID): {test_pmid}")
+    print(f"{'='*60}")
+    
+    try:
+        abstracts = await client.get_abstracts([test_pmid])
+        
+        if abstracts:
+            item = abstracts[0]
+            print(f"✅ Retrieved abstract for PMID: {item['pmid']}")
+            print(f"   Title: {item['title'][:100]}...")
+            print(f"   Journal: {item['journal']}")
+            print(f"   Year: {item['year']}")
+            
+            if item['authors']:
+                authors_str = ', '.join(item['authors'][:2])
+                if len(item['authors']) > 2:
+                    authors_str += f" et al."
+                print(f"   Authors: {authors_str}")
+            
+            abstract = item['abstract']
+            if len(abstract) > 200:
+                abstract = abstract[:200] + "..."
+            print(f"   Abstract: {abstract}")
+            
+            return item
+        
+    except Exception as e:
+        print(f"❌ Single fetch failed: {e}")
+        return None
+
+
+async def test_fetch_batch(client: PubMedClient, pmids: List[str]):
+    """Test the fetch_batch functionality for multiple PMIDs"""
+    if not pmids:
+        print("\n⚠️  No PMIDs available for batch fetch testing")
         return []
     
     # Test with first 3 PMIDs
     test_pmids = pmids[:3]
     
     print(f"\n{'='*60}")
-    print(f"TESTING FETCH: {len(test_pmids)} PMIDs")
+    print(f"TESTING FETCH_BATCH: {len(test_pmids)} PMIDs")
     print(f"{'='*60}")
     
     try:
         abstracts = await client.get_abstracts(test_pmids)
         
-        print(f"Retrieved {len(abstracts)} abstracts")
+        print(f"✅ Retrieved {len(abstracts)} abstracts in batch")
         
         for i, item in enumerate(abstracts, 1):
             print(f"\n{i}. PMID: {item['pmid']}")
@@ -87,7 +128,7 @@ async def test_fetch(client: PubMedClient, pmids: List[str]):
         return abstracts
         
     except Exception as e:
-        print(f"❌ Abstract retrieval failed: {e}")
+        print(f"❌ Batch fetch failed: {e}")
         return []
 
 
@@ -164,13 +205,16 @@ async def run_all_tests():
         # Test 1: Basic search
         pmids = await test_search(client)
         
-        # Test 2: Fetch (Abstract retrieval)
-        abstracts = await test_fetch(client, pmids)
+        # Test 2: Fetch Single (OpenAI MCP compliant)
+        single_abstract = await test_fetch_single(client, pmids)
         
-        # Test 3: Full text retrieval
+        # Test 3: Fetch Batch (Multiple PMIDs)
+        batch_abstracts = await test_fetch_batch(client, pmids)
+        
+        # Test 4: Full text retrieval
         await test_full_text(client)
         
-        # Test 4: MeSH queries
+        # Test 5: MeSH queries
         await test_mesh_queries(client)
     
     print(f"\n{'='*80}")
@@ -193,9 +237,15 @@ async def quick_test():
             if results['items']:
                 pmid = results['items'][0]['pmid']
                 
-                # Quick fetch test
+                # Quick fetch test (single PMID)
                 abstracts = await client.get_abstracts([pmid])
-                print(f"✅ Fetch: Retrieved abstract for PMID {pmid}")
+                print(f"✅ Fetch Single: Retrieved abstract for PMID {pmid}")
+                
+                # Quick batch fetch test (multiple PMIDs)
+                batch_abstracts = await client.get_abstracts([pmid, pmid])  # Duplicate for demo
+                print(f"✅ Fetch Batch: Retrieved {len(batch_abstracts)} abstracts")
+                
+                # Note: MCP server has both fetch (single) and fetch_batch (multiple) tools
                 
                 # Quick full text test (with known PMCID)
                 full_texts = await client.get_full_text(["PMC7920322"])

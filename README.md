@@ -1,9 +1,10 @@
 # PubMed MCP Server
 
-A Model Context Protocol (MCP) server that provides access to PubMed/PMC research data through three core functions:
+A Model Context Protocol (MCP) server that provides access to PubMed/PMC research data through four core functions:
 
 - **Search**: Query PubMed with MeSH support, returning up to 100 paper titles
-- **Fetch**: Retrieve abstracts for specific PMIDs  
+- **Fetch**: Retrieve abstract for a single PMID (OpenAI MCP compliant)
+- **Fetch Batch**: Retrieve abstracts for multiple PMIDs efficiently
 - **Get Full Text**: Retrieve full-text content for PMCIDs (JATS XML or OA URLs)
 
 ## Features
@@ -75,8 +76,6 @@ Query PubMed database with advanced search capabilities.
 
 **Parameters:**
 - `query` (string): Search query with MeSH support
-- `max_results` (int, optional): Max results to return (default: 100, max: 100)
-- `start_index` (int, optional): Starting index for pagination (default: 0)
 
 **Example Queries:**
 ```
@@ -89,27 +88,53 @@ Query PubMed database with advanced search capabilities.
 **Response:**
 ```json
 {
-  "count": 1234,
-  "items": [
+  "results": [
     {
-      "pmid": "12345678",
+      "id": "12345678",
       "title": "Study Title",
-      "pubdate": "2023",
-      "journal": "Journal Name",
-      "authors": ["Author 1", "Author 2"]
+      "url": "https://pubmed.ncbi.nlm.nih.gov/12345678/"
     }
-  ],
-  "retmax": 100,
-  "retstart": 0
+  ]
 }
 ```
 
 ### 2. Fetch
 
-Retrieve abstracts for specific PMIDs.
+Retrieve abstract for a **single PMID only** (OpenAI MCP compliant).
+
+**Important:** This tool accepts exactly one PMID per request. For multiple PMIDs, use `fetch_batch`.
 
 **Parameters:**
-- `pmids` (array): List of PubMed IDs
+- `id` (string): Single PubMed ID (PMID) - **NO ARRAYS OR COMMA-SEPARATED VALUES**
+
+**Example:**
+```json
+{
+  "id": "40930554"
+}
+```
+
+**Response:**
+```json
+{
+  "id": "40930554",
+  "title": "Paper Title",
+  "text": "Background: ... Methods: ... Results: ... Conclusions: ...",
+  "url": "https://pubmed.ncbi.nlm.nih.gov/40930554/",
+  "metadata": {
+    "journal": "Journal Name",
+    "year": "2024",
+    "authors": ["Author 1", "Author 2"]
+  }
+}
+```
+
+### 3. Fetch Batch
+
+Retrieve abstracts for multiple PMIDs efficiently in one request.
+
+**Parameters:**
+- `pmids` (array): List of PubMed IDs (PMIDs)
 
 **Example:**
 ```json
@@ -124,17 +149,25 @@ Retrieve abstracts for specific PMIDs.
   "items": [
     {
       "pmid": "40930554",
-      "title": "Paper Title",
+      "title": "Paper Title 1",
       "abstract": "Background: ... Methods: ... Results: ... Conclusions: ...",
       "journal": "Journal Name",
       "year": "2024",
       "authors": ["Author 1", "Author 2"]
+    },
+    {
+      "pmid": "40929575", 
+      "title": "Paper Title 2",
+      "abstract": "Background: ... Methods: ... Results: ... Conclusions: ...",
+      "journal": "Another Journal",
+      "year": "2024",
+      "authors": ["Author 3", "Author 4"]
     }
   ]
 }
 ```
 
-### 3. Get Full Text
+### 4. Get Full Text
 
 Retrieve full-text content for PMCIDs.
 
@@ -199,7 +232,7 @@ The server supports advanced PubMed search syntax:
 1. Start the server locally
 2. Use the URL: `http://localhost:8000/sse/`
 3. Configure as MCP connector in your AI interface
-4. Enable tools: `search`, `fetch`, `get_full_text`
+4. Enable tools: `search`, `fetch`, `fetch_batch`, `get_full_text`
 
 ## Rate Limiting & Compliance
 

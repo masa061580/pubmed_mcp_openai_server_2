@@ -6,6 +6,7 @@ providing search, abstract retrieval, and full-text capabilities.
 """
 
 import asyncio
+import json
 import logging
 import os
 import time
@@ -73,8 +74,9 @@ server_instructions = """
 This MCP server provides PubMed/PMC research capabilities with three main tools:
 
 1. search: Query PubMed database with MeSH support, returning up to 100 paper titles
-2. fetch: Retrieve abstracts for specific PMIDs
-3. get_full_text: Retrieve full-text content for PMCIDs (JATS XML or OA service URLs)
+2. fetch: Retrieve abstract for a single PMID (OpenAI MCP compliant)
+3. fetch_batch: Retrieve abstracts for multiple PMIDs in one request
+4. get_full_text: Retrieve full-text content for PMCIDs (JATS XML or OA service URLs)
 
 All queries respect NCBI rate limits and usage policies.
 """
@@ -356,40 +358,104 @@ def create_server() -> FastMCP:
     mcp = FastMCP(name="PubMed MCP Server", instructions=server_instructions)
     
     @mcp.tool()
-    async def search(query: str, max_results: int = 100, start_index: int = 0) -> Dict[str, Any]:
+    async def search(query: str) -> str:
         """
         Search PubMed database with MeSH support.
         
         Args:
             query: Search query string. Supports MeSH terms (e.g., "asthma[mh] AND adult[mh]")
-            max_results: Maximum number of results to return (default: 100, max: 100)
-            start_index: Starting index for pagination (default: 0)
         
         Returns:
-            Dictionary containing search results with paper metadata
+            JSON string containing search results with paper metadata
         """
         if not query or not query.strip():
-            return {"count": 0, "items": [], "retmax": max_results, "retstart": start_index}
-        
-        # Limit max_results to 100 as per specification
-        max_results = min(max_results, 100)
+            empty_result = {"results": []}
+            return json.dumps(empty_result)
         
         async with PubMedClient() as client:
             try:
-                results = await client.search_pubmed(query, max_results, start_index)
+                results = await client.search_pubmed(query, retmax=100, retstart=0)
                 logger.info(f"Search returned {len(results['items'])} results for query: {query}")
-                return results
+                
+                # Transform to OpenAI MCP format
+                search_results = []
+                for item in results['items']:
+                    search_results.append({
+                        "id": item['pmid'],
+                        "title": item['title'],
+                        "url": f"https://pubmed.ncbi.nlm.nih.gov/{item['pmid']}/"
+                    })
+                
+                mcp_result = {"results": search_results}
+                return json.dumps(mcp_result)
+                
             except Exception as e:
                 logger.error(f"Search failed: {e}")
                 raise ValueError(f"Search failed: {str(e)}")
     
     @mcp.tool()
-    async def fetch(pmids: List[str]) -> Dict[str, List[Dict[str, Any]]]:
+    async def fetch(id: str) -> str:
         """
-        Retrieve abstracts for specific PMIDs.
+        Retrieve abstract for a single PMID (OpenAI MCP compliant).
+        
+        This tool is designed to comply with OpenAI MCP specification and
+        processes exactly one PMID per request. For multiple PMIDs, use fetch_batch.
         
         Args:
-            pmids: List of PubMed IDs (PMIDs)
+            id: Single PubMed ID (PMID) as string - NO ARRAYS OR COMMA-SEPARATED VALUES
+        
+        Returns:
+            JSON string containing document with id, title, text, url, and metadata
+        """
+        if not id or not id.strip():
+            raise ValueError("Single document ID is required")
+        
+        pmid = id.strip()
+        
+        # Validate that it's a single PMID (no commas, no array-like input)
+        if ',' in pmid or '[' in pmid or ']' in pmid:
+            raise ValueError("fetch tool accepts only a single PMID. Use fetch_batch for multiple PMIDs.")
+        
+        async with PubMedClient() as client:
+            try:
+                abstracts = await client.get_abstracts([pmid])
+                logger.info(f"Retrieved abstract for single PMID: {pmid}")
+                
+                if not abstracts:
+                    raise ValueError(f"No abstract found for PMID: {pmid}")
+                
+                # Get the first (and only) abstract
+                abstract_data = abstracts[0]
+                
+                # Transform to OpenAI MCP format
+                document = {
+                    "id": pmid,
+                    "title": abstract_data.get("title", "No title available"),
+                    "text": abstract_data.get("abstract", "No abstract available"),
+                    "url": f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/",
+                    "metadata": {
+                        "journal": abstract_data.get("journal", "Unknown journal"),
+                        "year": abstract_data.get("year", "Unknown"),
+                        "authors": abstract_data.get("authors", [])
+                    }
+                }
+                
+                return json.dumps(document)
+                
+            except Exception as e:
+                logger.error(f"Abstract retrieval failed for PMID {pmid}: {e}")
+                raise ValueError(f"Abstract retrieval failed: {str(e)}")
+    
+    @mcp.tool()
+    async def fetch_batch(pmids: List[str]) -> Dict[str, List[Dict[str, Any]]]:
+        """
+        Retrieve abstracts for multiple PMIDs in a single batch request.
+        
+        This tool is optimized for processing multiple PMIDs efficiently
+        and returns results in a structured format for batch operations.
+        
+        Args:
+            pmids: List of PubMed IDs (PMIDs) as strings
         
         Returns:
             Dictionary with 'items' containing abstract data for each PMID
@@ -400,14 +466,17 @@ def create_server() -> FastMCP:
         # Remove duplicates and validate PMIDs
         unique_pmids = list(set(str(pmid).strip() for pmid in pmids if str(pmid).strip()))
         
+        if not unique_pmids:
+            return {"items": []}
+        
         async with PubMedClient() as client:
             try:
                 abstracts = await client.get_abstracts(unique_pmids)
-                logger.info(f"Retrieved {len(abstracts)} abstracts for {len(unique_pmids)} PMIDs")
+                logger.info(f"Retrieved {len(abstracts)} abstracts for {len(unique_pmids)} PMIDs in batch")
                 return {"items": abstracts}
             except Exception as e:
-                logger.error(f"Abstract retrieval failed: {e}")
-                raise ValueError(f"Abstract retrieval failed: {str(e)}")
+                logger.error(f"Batch abstract retrieval failed: {e}")
+                raise ValueError(f"Batch abstract retrieval failed: {str(e)}")
     
     @mcp.tool()
     async def get_full_text(pmcids: List[str]) -> Dict[str, Any]:
