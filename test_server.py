@@ -49,8 +49,8 @@ async def test_search(client: PubMedClient, query: str = "COVID-19 AND vaccine",
         return []
 
 
-async def test_abstracts(client: PubMedClient, pmids: List[str]):
-    """Test the abstract retrieval functionality"""
+async def test_fetch(client: PubMedClient, pmids: List[str]):
+    """Test the fetch functionality (abstract retrieval)"""
     if not pmids:
         print("\n⚠️  No PMIDs available for abstract testing")
         return []
@@ -59,7 +59,7 @@ async def test_abstracts(client: PubMedClient, pmids: List[str]):
     test_pmids = pmids[:3]
     
     print(f"\n{'='*60}")
-    print(f"TESTING ABSTRACTS: {len(test_pmids)} PMIDs")
+    print(f"TESTING FETCH: {len(test_pmids)} PMIDs")
     print(f"{'='*60}")
     
     try:
@@ -164,8 +164,8 @@ async def run_all_tests():
         # Test 1: Basic search
         pmids = await test_search(client)
         
-        # Test 2: Abstract retrieval
-        abstracts = await test_abstracts(client, pmids)
+        # Test 2: Fetch (Abstract retrieval)
+        abstracts = await test_fetch(client, pmids)
         
         # Test 3: Full text retrieval
         await test_full_text(client)
@@ -193,9 +193,9 @@ async def quick_test():
             if results['items']:
                 pmid = results['items'][0]['pmid']
                 
-                # Quick abstract test
+                # Quick fetch test
                 abstracts = await client.get_abstracts([pmid])
-                print(f"✅ Abstract: Retrieved for PMID {pmid}")
+                print(f"✅ Fetch: Retrieved abstract for PMID {pmid}")
                 
                 # Quick full text test (with known PMCID)
                 full_texts = await client.get_full_text(["PMC7920322"])

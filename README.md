@@ -3,7 +3,7 @@
 A Model Context Protocol (MCP) server that provides access to PubMed/PMC research data through three core functions:
 
 - **Search**: Query PubMed with MeSH support, returning up to 100 paper titles
-- **Get Abstract**: Retrieve abstracts for specific PMIDs  
+- **Fetch**: Retrieve abstracts for specific PMIDs  
 - **Get Full Text**: Retrieve full-text content for PMCIDs (JATS XML or OA URLs)
 
 ## Features
@@ -104,7 +104,7 @@ Query PubMed database with advanced search capabilities.
 }
 ```
 
-### 2. Get Abstract
+### 2. Fetch
 
 Retrieve abstracts for specific PMIDs.
 
@@ -199,7 +199,7 @@ The server supports advanced PubMed search syntax:
 1. Start the server locally
 2. Use the URL: `http://localhost:8000/sse/`
 3. Configure as MCP connector in your AI interface
-4. Enable tools: `search`, `get_abstract`, `get_full_text`
+4. Enable tools: `search`, `fetch`, `get_full_text`
 
 ## Rate Limiting & Compliance
 

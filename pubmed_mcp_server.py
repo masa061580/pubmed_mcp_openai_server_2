@@ -73,7 +73,7 @@ server_instructions = """
 This MCP server provides PubMed/PMC research capabilities with three main tools:
 
 1. search: Query PubMed database with MeSH support, returning up to 100 paper titles
-2. get_abstract: Retrieve abstracts for specific PMIDs
+2. fetch: Retrieve abstracts for specific PMIDs
 3. get_full_text: Retrieve full-text content for PMCIDs (JATS XML or OA service URLs)
 
 All queries respect NCBI rate limits and usage policies.
@@ -384,7 +384,7 @@ def create_server() -> FastMCP:
                 raise ValueError(f"Search failed: {str(e)}")
     
     @mcp.tool()
-    async def get_abstract(pmids: List[str]) -> Dict[str, List[Dict[str, Any]]]:
+    async def fetch(pmids: List[str]) -> Dict[str, List[Dict[str, Any]]]:
         """
         Retrieve abstracts for specific PMIDs.
         
