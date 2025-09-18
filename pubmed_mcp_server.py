@@ -71,12 +71,14 @@ rate_limiter = StrictRateLimiter(MAX_REQUESTS_PER_SECOND)
 
 # Server configuration
 server_instructions = """
-This MCP server provides PubMed/PMC research capabilities with three main tools:
+This MCP server provides PubMed/PMC research capabilities with six main tools:
 
-1. search: Query PubMed database with MeSH support, returning up to 100 paper titles
+1. search: PubMed queries with MeSH support, returning up to 100 paper titles with PMCID detection
 2. fetch: Retrieve abstract for a single PMID (OpenAI MCP compliant)
 3. fetch_batch: Retrieve abstracts for multiple PMIDs in one request
 4. get_full_text: Retrieve full-text content for PMCIDs (JATS XML or OA service URLs)
+5. count: Get result count for a query (for search optimization)
+6. count_batch: Get counts for multiple queries efficiently
 
 All queries respect NCBI rate limits and usage policies.
 """
@@ -137,7 +139,7 @@ class PubMedClient:
             raise PubMedAPIError(f"Network request failed: {e}")
     
     async def search_pubmed(self, query: str, retmax: int = 100, retstart: int = 0) -> Dict[str, Any]:
-        """Search PubMed using esearch and esummary"""
+        """Search PubMed using esearch and esummary with PMCID detection"""
         # Step 1: esearch to get PMIDs
         search_params = {
             "db": "pubmed",
@@ -167,7 +169,7 @@ class PubMedClient:
                 "retstart": retstart
             }
         
-        # Step 2: esummary to get titles and metadata
+        # Step 2: esummary to get titles, metadata, and PMCIDs from articleids
         summary_params = {
             "db": "pubmed",
             "id": ",".join(pmids),
@@ -182,13 +184,26 @@ class PubMedClient:
             for pmid in pmids:
                 if pmid in summary_data["result"]:
                     paper = summary_data["result"][pmid]
-                    items.append({
+                    
+                    # Extract PMCID from articleids
+                    pmcid = None
+                    if "articleids" in paper:
+                        for article_id in paper["articleids"]:
+                            if article_id.get("idtype") == "pmc":
+                                pmcid = article_id.get("value")
+                                break
+                    
+                    item = {
                         "pmid": pmid,
+                        "pmcid": pmcid,
                         "title": paper.get("title", "No title available"),
                         "pubdate": paper.get("pubdate", "Unknown"),
                         "journal": paper.get("fulljournalname", paper.get("source", "Unknown journal")),
-                        "authors": [author.get("name", "") for author in paper.get("authors", [])]
-                    })
+                        "authors": [author.get("name", "") for author in paper.get("authors", [])],
+                        "full_text_available": pmcid is not None
+                    }
+                    
+                    items.append(item)
         
         return {
             "count": count,
@@ -196,6 +211,65 @@ class PubMedClient:
             "retmax": retmax,
             "retstart": retstart
         }
+    
+    async def count_search(self, query: str) -> Dict[str, Any]:
+        """Get only the count of search results for query adjustment"""
+        # Use esearch with retmax=0 for fast count-only response
+        search_params = {
+            "db": "pubmed",
+            "term": query,
+            "retmode": "json",
+            "retmax": 0,  # Don't retrieve any IDs, just count
+        }
+        
+        logger.info(f"Counting results for query: {query}")
+        search_response = await self._make_request(f"{NCBI_BASE_URL}/esearch.fcgi", search_params)
+        search_data = search_response.json()
+        
+        if "esearchresult" not in search_data:
+            raise PubMedAPIError("Invalid response from esearch")
+        
+        result = search_data["esearchresult"]
+        
+        # Extract count and query translation info
+        count = int(result.get("count", 0))
+        
+        # Get query translation to show how PubMed interpreted the query
+        query_translation = result.get("querytranslation", "")
+        
+        # Get any warnings about the search
+        warning_list = result.get("warninglist", {})
+        warnings = []
+        if warning_list:
+            phrase_ignored = warning_list.get("phraseignored", [])
+            quoted_phrase_not_found = warning_list.get("quotedphrasefound", [])
+            if phrase_ignored:
+                warnings.extend(phrase_ignored)
+            if quoted_phrase_not_found:
+                warnings.extend(quoted_phrase_not_found)
+        
+        return {
+            "query": query,
+            "count": count,
+            "query_translation": query_translation,
+            "warnings": warnings
+        }
+    
+    async def count_batch(self, queries: List[str]) -> List[Dict[str, Any]]:
+        """Get counts for multiple queries efficiently"""
+        results = []
+        for query in queries:
+            try:
+                result = await self.count_search(query)
+                results.append(result)
+            except Exception as e:
+                logger.error(f"Failed to count for query '{query}': {e}")
+                results.append({
+                    "query": query,
+                    "count": -1,
+                    "error": str(e)
+                })
+        return results
     
     async def get_abstracts(self, pmids: List[str]) -> List[Dict[str, Any]]:
         """Get abstracts for given PMIDs using efetch"""
@@ -374,17 +448,27 @@ def create_server() -> FastMCP:
         
         async with PubMedClient() as client:
             try:
+                # Use search with PMCID detection from esummary articleids
                 results = await client.search_pubmed(query, retmax=100, retstart=0)
                 logger.info(f"Search returned {len(results['items'])} results for query: {query}")
                 
-                # Transform to OpenAI MCP format
+                # Transform to OpenAI MCP format with PMCID info
                 search_results = []
                 for item in results['items']:
-                    search_results.append({
+                    result_item = {
                         "id": item['pmid'],
                         "title": item['title'],
                         "url": f"https://pubmed.ncbi.nlm.nih.gov/{item['pmid']}/"
-                    })
+                    }
+                    
+                    # Add PMCID and full_text_available if present
+                    if item.get('pmcid'):
+                        result_item['pmcid'] = item['pmcid']
+                        result_item['full_text_available'] = True
+                    else:
+                        result_item['full_text_available'] = False
+                    
+                    search_results.append(result_item)
                 
                 mcp_result = {"results": search_results}
                 return json.dumps(mcp_result)
@@ -515,6 +599,84 @@ def create_server() -> FastMCP:
             except Exception as e:
                 logger.error(f"Full text retrieval failed: {e}")
                 raise ValueError(f"Full text retrieval failed: {str(e)}")
+    
+    @mcp.tool()
+    async def count(query: str) -> str:
+        """
+        Get only the count of search results for query adjustment and optimization.
+        
+        This tool is designed for quickly checking how many papers match a query
+        without retrieving the actual results. Useful for refining search strategies
+        and testing different query combinations.
+        
+        Args:
+            query: Search query string. Supports MeSH terms and all PubMed search syntax.
+        
+        Returns:
+            JSON string containing:
+            - query: The original query
+            - count: Number of matching papers
+            - query_translation: How PubMed interpreted the query (useful for debugging)
+            - warnings: Any search warnings (e.g., ignored phrases)
+        
+        Example queries:
+            - "cancer" - Very broad search
+            - "lung cancer[mh]" - MeSH term search
+            - "COVID-19[tiab] AND 2024[dp]" - Title/Abstract with date filter
+            - "clinical trial[pt] AND diabetes[majr]" - Publication type with major topic
+        """
+        if not query or not query.strip():
+            return json.dumps({
+                "query": query,
+                "count": 0,
+                "query_translation": "",
+                "warnings": []
+            })
+        
+        async with PubMedClient() as client:
+            try:
+                result = await client.count_search(query)
+                logger.info(f"Count for '{query}': {result['count']} results")
+                return json.dumps(result)
+                
+            except Exception as e:
+                logger.error(f"Count search failed: {e}")
+                raise ValueError(f"Count search failed: {str(e)}")
+    
+    @mcp.tool()
+    async def count_batch(queries: List[str]) -> str:
+        """
+        Get counts for multiple search queries in a single batch.
+        
+        This tool efficiently checks the result counts for multiple queries,
+        useful for comparing different search strategies or testing variations.
+        
+        Args:
+            queries: List of search query strings
+        
+        Returns:
+            JSON string containing an array of count results for each query
+        
+        Example:
+            queries = [
+                "diabetes",
+                "diabetes[mh]",
+                "diabetes[majr]",
+                "diabetes[mh] AND clinical trial[pt]"
+            ]
+        """
+        if not queries:
+            return json.dumps([])
+        
+        async with PubMedClient() as client:
+            try:
+                results = await client.count_batch(queries)
+                logger.info(f"Batch count completed for {len(queries)} queries")
+                return json.dumps(results)
+                
+            except Exception as e:
+                logger.error(f"Batch count failed: {e}")
+                raise ValueError(f"Batch count failed: {str(e)}")
     
     return mcp
 

@@ -1,15 +1,18 @@
 # PubMed MCP Server
 
-A Model Context Protocol (MCP) server that provides access to PubMed/PMC research data through four core functions:
+A Model Context Protocol (MCP) server that provides access to PubMed/PMC research data through six core functions:
 
-- **Search**: Query PubMed with MeSH support, returning up to 100 paper titles
+- **Search**: Query PubMed with MeSH support, returning up to 100 paper titles with PMCID info
 - **Fetch**: Retrieve abstract for a single PMID (OpenAI MCP compliant)
 - **Fetch Batch**: Retrieve abstracts for multiple PMIDs efficiently
 - **Get Full Text**: Retrieve full-text content for PMCIDs (JATS XML or OA URLs)
+- **Count**: Get result count for query optimization and refinement
+- **Count Batch**: Get counts for multiple queries efficiently
 
 ## Features
 
 - **MeSH Query Support**: Advanced medical subject heading searches
+- **PMCID Detection**: Automatically identifies papers with PMC full-text availability
 - **Rate Limited**: Respects NCBI guidelines (3-10 req/s depending on API key)
 - **XML Parsing**: Handles PubMed XML responses with proper error handling
 - **Open Access Integration**: Detects and provides PDF URLs for OA articles
@@ -92,7 +95,9 @@ Query PubMed database with advanced search capabilities.
     {
       "id": "12345678",
       "title": "Study Title",
-      "url": "https://pubmed.ncbi.nlm.nih.gov/12345678/"
+      "url": "https://pubmed.ncbi.nlm.nih.gov/12345678/",
+      "pmcid": "PMC1234567",  // Present if full text available in PMC
+      "full_text_available": true  // Indicates PMC full text availability
     }
   ]
 }
@@ -198,6 +203,72 @@ Retrieve full-text content for PMCIDs.
     "PDF URLs are only available for Open Access articles"
   ]
 }
+```
+
+### 5. Count
+
+Get result count for a search query without retrieving papers (for query optimization).
+
+**Parameters:**
+- `query` (string): Search query with MeSH support
+
+**Example:**
+```json
+{
+  "query": "lung cancer[mh] AND 2024[dp]"
+}
+```
+
+**Response:**
+```json
+{
+  "query": "lung cancer[mh] AND 2024[dp]",
+  "count": 12543,
+  "query_translation": "\"lung neoplasms\"[MeSH Terms] AND 2024[dp]",
+  "warnings": []
+}
+```
+
+### 6. Count Batch
+
+Get counts for multiple queries efficiently (for comparing search strategies).
+
+**Parameters:**
+- `queries` (array): List of search queries
+
+**Example:**
+```json
+{
+  "queries": [
+    "diabetes",
+    "diabetes[mh]",
+    "diabetes[majr]",
+    "diabetes[mh] AND clinical trial[pt]"
+  ]
+}
+```
+
+**Response:**
+```json
+[
+  {"query": "diabetes", "count": 1072365, "query_translation": "..."},
+  {"query": "diabetes[mh]", "count": 562256, "query_translation": "..."},
+  {"query": "diabetes[majr]", "count": 287431, "query_translation": "..."},
+  {"query": "diabetes[mh] AND clinical trial[pt]", "count": 45123, "query_translation": "..."}
+]
+```
+
+## Query Refinement Workflow
+
+The count tools enable efficient query refinement:
+
+```python
+# Start broad, then refine
+"cancer"                                    # 5,000,000+ results (too broad)
+"lung cancer"                               # 800,000 results
+"lung cancer[mh]"                          # 400,000 results (MeSH term)
+"lung cancer[mh] AND 2024[dp]"            # 12,000 results
+"lung cancer[majr] AND clinical trial[pt] AND 2024[dp]"  # 450 results (optimal)
 ```
 
 ## MeSH Search Examples

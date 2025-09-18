@@ -55,3 +55,9 @@ Thumbs.db
 *.temp
 temp/
 tmp/
+
+# Test files (keep only main test files)
+test_*_quick.py
+test_*_esummary.py
+test_*_fix.py
+test_pmcid_*.py
