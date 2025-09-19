@@ -61,3 +61,6 @@ test_*_quick.py
 test_*_esummary.py
 test_*_fix.py
 test_pmcid_*.py
+
+OpenAI_MCP.md
+Pubmed_API_MCP.md

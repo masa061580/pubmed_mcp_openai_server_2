@@ -73,12 +73,12 @@ rate_limiter = StrictRateLimiter(MAX_REQUESTS_PER_SECOND)
 server_instructions = """
 This MCP server provides PubMed/PMC research capabilities with six main tools:
 
-1. search: PubMed queries with MeSH support, returning up to 100 paper titles with PMCID detection
+1. search: PubMed queries with MeSH support, returning configurable number of paper titles (1-200, default: 50) with PMCID detection. Supports Best Match (relevance) and Most Recent (pub_date) sorting
 2. fetch: Retrieve abstract for a single PMID (OpenAI MCP compliant)
 3. fetch_batch: Retrieve abstracts for multiple PMIDs in one request
-4. get_full_text: Retrieve full-text content for PMCIDs (JATS XML or OA service URLs)
+4. get_full_text: Retrieve full-text content for PMCIDs (sections only)
 5. count: Get result count for a query (for search optimization)
-6. count_batch: Get counts for multiple queries efficiently
+6. find_similar_articles: Find similar articles using PubMed's recommendation algorithm
 
 All queries respect NCBI rate limits and usage policies.
 """
@@ -138,8 +138,15 @@ class PubMedClient:
             logger.error(f"Request failed: {e}")
             raise PubMedAPIError(f"Network request failed: {e}")
     
-    async def search_pubmed(self, query: str, retmax: int = 100, retstart: int = 0) -> Dict[str, Any]:
-        """Search PubMed using esearch and esummary with PMCID detection"""
+    async def search_pubmed(self, query: str, retmax: int = 100, retstart: int = 0, sort: str = "relevance") -> Dict[str, Any]:
+        """Search PubMed using esearch and esummary with PMCID detection
+
+        Args:
+            query: Search query string
+            retmax: Maximum number of results to return
+            retstart: Starting position for results
+            sort: Sort order - "relevance" for Best Match (ML-based), "pub_date" for Most Recent
+        """
         # Step 1: esearch to get PMIDs
         search_params = {
             "db": "pubmed",
@@ -147,10 +154,11 @@ class PubMedClient:
             "retmode": "json",
             "retmax": retmax,
             "retstart": retstart,
-            "usehistory": "y"
+            "usehistory": "y",
+            "sort": sort  # Add sort parameter (relevance=Best Match, pub_date=Most Recent)
         }
         
-        logger.info(f"Searching PubMed: {query}")
+        logger.info(f"Searching PubMed: {query} (sort: {sort})")
         search_response = await self._make_request(f"{NCBI_BASE_URL}/esearch.fcgi", search_params)
         search_data = search_response.json()
         
@@ -254,23 +262,183 @@ class PubMedClient:
             "query_translation": query_translation,
             "warnings": warnings
         }
-    
-    async def count_batch(self, queries: List[str]) -> List[Dict[str, Any]]:
-        """Get counts for multiple queries efficiently"""
-        results = []
-        for query in queries:
-            try:
-                result = await self.count_search(query)
-                results.append(result)
-            except Exception as e:
-                logger.error(f"Failed to count for query '{query}': {e}")
-                results.append({
-                    "query": query,
-                    "count": -1,
-                    "error": str(e)
-                })
-        return results
-    
+
+    async def find_similar_articles(self, pmid: str, retmax: int = 20) -> Dict[str, Any]:
+        """Find similar articles using elink API
+
+        Args:
+            pmid: PubMed ID of the reference article
+            retmax: Maximum number of similar articles to return (default: 20, max: 100)
+
+        Returns:
+            Dictionary containing similar articles with metadata
+        """
+        if not pmid or not pmid.strip():
+            return {
+                "reference_pmid": pmid,
+                "similar_articles": [],
+                "count": 0,
+                "error": "No PMID provided"
+            }
+
+        # Validate and constrain retmax parameter
+        if retmax < 1:
+            retmax = 1
+        elif retmax > 100:
+            retmax = 100
+
+        try:
+            # Alternative approach: Use the article's metadata to find similar articles
+            # Step 1: Get the article's abstract and metadata first
+            fetch_params = {
+                "db": "pubmed",
+                "id": pmid.strip(),
+                "retmode": "xml",
+                "rettype": "abstract"
+            }
+
+            logger.info(f"Getting article metadata for PMID: {pmid}")
+            fetch_response = await self._make_request(f"{NCBI_BASE_URL}/efetch.fcgi", fetch_params, method="POST")
+
+            # Parse XML to extract MeSH terms and keywords
+            import xml.etree.ElementTree as ET
+            root = ET.fromstring(fetch_response.text)
+
+            # Extract MeSH terms for similarity search
+            mesh_terms = []
+            for mesh_heading in root.findall(".//MeshHeading"):
+                descriptor = mesh_heading.find("DescriptorName")
+                if descriptor is not None:
+                    mesh_terms.append(descriptor.text)
+
+            # Extract title words for similarity
+            title_elem = root.find(".//ArticleTitle")
+            title = title_elem.text if title_elem is not None else ""
+
+            if not mesh_terms and not title:
+                return {
+                    "reference_pmid": pmid,
+                    "similar_articles": [],
+                    "count": 0,
+                    "error": "Could not extract metadata for similarity search"
+                }
+
+            # Step 2: Build a search query using the extracted MeSH terms and title words
+            search_terms = []
+
+            # Add top MeSH terms (limit to avoid too broad search)
+            for mesh_term in mesh_terms[:3]:  # Use top 3 MeSH terms
+                search_terms.append(f'"{mesh_term}"[MeSH Terms]')
+
+            # Add key title words (excluding common words)
+            if title:
+                title_words = [word.strip('.,;:()[]{}').lower()
+                             for word in title.split()
+                             if len(word) > 3 and word.lower() not in
+                             ['the', 'and', 'for', 'with', 'from', 'that', 'this', 'study', 'analysis']]
+                for word in title_words[:2]:  # Use top 2 meaningful title words
+                    search_terms.append(f'"{word}"[Title/Abstract]')
+
+            if not search_terms:
+                return {
+                    "reference_pmid": pmid,
+                    "similar_articles": [],
+                    "count": 0,
+                    "error": "Could not build similarity search query"
+                }
+
+            # Build search query
+            search_query = " OR ".join(search_terms)
+            # Exclude the original article
+            search_query += f" NOT {pmid}[PMID]"
+
+            logger.info(f"Similarity search query: {search_query}")
+
+            # Step 3: Use esearch to find similar articles
+            search_params = {
+                "db": "pubmed",
+                "term": search_query,
+                "retmode": "json",
+                "retmax": retmax,
+                "sort": "relevance",  # Sort by relevance for better similarity
+                "usehistory": "y"
+            }
+
+            search_response = await self._make_request(f"{NCBI_BASE_URL}/esearch.fcgi", search_params)
+            search_data = search_response.json()
+
+            if "esearchresult" not in search_data:
+                return {
+                    "reference_pmid": pmid,
+                    "similar_articles": [],
+                    "count": 0,
+                    "error": "Invalid search response"
+                }
+
+            result = search_data["esearchresult"]
+            similar_pmids = result.get("idlist", [])
+
+            if not similar_pmids:
+                return {
+                    "reference_pmid": pmid,
+                    "similar_articles": [],
+                    "count": 0,
+                    "error": "No similar articles found"
+                }
+
+            # similar_pmids are already limited by retmax in esearch
+            # Step 4: Get metadata for similar articles using esummary
+            summary_params = {
+                "db": "pubmed",
+                "id": ",".join(similar_pmids),
+                "retmode": "json"
+            }
+
+            summary_response = await self._make_request(f"{NCBI_BASE_URL}/esummary.fcgi", summary_params)
+            summary_data = summary_response.json()
+
+            # Process results
+            similar_articles = []
+            if "result" in summary_data:
+                for pmid_id in similar_pmids:
+                    if pmid_id in summary_data["result"]:
+                        paper = summary_data["result"][pmid_id]
+
+                        # Extract PMCID from articleids if available
+                        pmcid = None
+                        if "articleids" in paper:
+                            for article_id in paper["articleids"]:
+                                if article_id.get("idtype") == "pmc":
+                                    pmcid = article_id.get("value")
+                                    break
+
+                        similar_articles.append({
+                            "pmid": pmid_id,
+                            "pmcid": pmcid,
+                            "title": paper.get("title", "No title available"),
+                            "authors": [author.get("name", "") for author in paper.get("authors", [])],
+                            "journal": paper.get("fulljournalname", paper.get("source", "Unknown journal")),
+                            "pubdate": paper.get("pubdate", "Unknown"),
+                            "url": f"https://pubmed.ncbi.nlm.nih.gov/{pmid_id}/",
+                            "full_text_available": pmcid is not None
+                        })
+
+            return {
+                "reference_pmid": pmid,
+                "similar_articles": similar_articles,
+                "count": len(similar_articles),
+                "error": None
+            }
+
+        except Exception as e:
+            logger.error(f"Failed to find similar articles for PMID {pmid}: {e}")
+            return {
+                "reference_pmid": pmid,
+                "similar_articles": [],
+                "count": 0,
+                "error": str(e)
+            }
+
     async def get_abstracts(self, pmids: List[str]) -> List[Dict[str, Any]]:
         """Get abstracts for given PMIDs using efetch"""
         if not pmids:
@@ -346,74 +514,178 @@ class PubMedClient:
             logger.error(f"XML parsing error: {e}")
             raise PubMedAPIError(f"Failed to parse XML response: {e}")
     
-    async def get_full_text(self, pmcids: List[str]) -> List[Dict[str, Any]]:
-        """Get full text for given PMCIDs using efetch and OA service"""
-        if not pmcids:
-            return []
+    def _parse_jats_body(self, jats_xml: str) -> Dict[str, Any]:
+        """Parse JATS XML to extract body text content only (excluding front metadata)"""
+        try:
+            if not jats_xml or "does not allow downloading" in jats_xml:
+                return {
+                    "body_text": None,
+                    "sections": [],
+                    "error": "Full text not available due to publisher restrictions"
+                }
+
+            root = ET.fromstring(jats_xml)
+
+            # JATS XML structure: pmc-articleset > article > body
+            # We only want the body element, not front (metadata)
+            article = root.find('.//article')
+            if article is None:
+                # Try direct body search if article element is not found
+                body = root.find('.//body')
+            else:
+                # Standard JATS path: article > body
+                body = article.find('.//body')
+
+            if body is None:
+                return {
+                    "body_text": None,
+                    "sections": [],
+                    "error": "No body element found in JATS XML"
+                }
+
+            def extract_text_from_element(element):
+                """Recursively extract all text from an element and its children"""
+                text_parts = []
+                if element.text:
+                    text_parts.append(element.text.strip())
+                for child in element:
+                    text_parts.extend(extract_text_from_element(child))
+                    if child.tail:
+                        text_parts.append(child.tail.strip())
+                return [t for t in text_parts if t]
+
+            # Extract sections from body only
+            sections = []
+            # Direct children sections of body
+            for sec in body.findall('./sec'):
+                # Get section title
+                title_elem = sec.find('./title')
+                title = title_elem.text.strip() if title_elem is not None and title_elem.text else "Untitled Section"
+
+                # Get paragraphs directly in this section
+                paragraphs = sec.findall('./p')
+                section_text_parts = []
+                for p in paragraphs:
+                    p_text = extract_text_from_element(p)
+                    if p_text:
+                        section_text_parts.append(" ".join(p_text))
+
+                # Also check for nested subsections
+                for subsec in sec.findall('.//sec'):
+                    subsec_title = subsec.find('./title')
+                    if subsec_title is not None and subsec_title.text:
+                        section_text_parts.append(f"\n{subsec_title.text.strip()}:")
+                    for p in subsec.findall('./p'):
+                        p_text = extract_text_from_element(p)
+                        if p_text:
+                            section_text_parts.append(" ".join(p_text))
+
+                section_text = "\n\n".join(section_text_parts)
+
+                if section_text:  # Only add sections with actual content
+                    sections.append({
+                        "title": title,
+                        "text": section_text
+                    })
+
+            # Extract all body text (excluding front metadata)
+            all_body_text = extract_text_from_element(body)
+            full_body_text = " ".join(all_body_text)
+
+            return {
+                "body_text": full_body_text,
+                "sections": sections,
+                "error": None
+            }
+            
+        except ET.ParseError as e:
+            return {
+                "body_text": None,
+                "sections": [],
+                "error": f"XML parsing error: {str(e)}"
+            }
+        except Exception as e:
+            return {
+                "body_text": None,
+                "sections": [],
+                "error": f"Error parsing JATS XML: {str(e)}"
+            }
+
+    async def get_full_text(self, pmcid: str) -> Dict[str, Any]:
+        """Get full text for a single PMCID using efetch and OA service"""
+        if not pmcid:
+            return {
+                "pmcid": None,
+                "sections": [],
+                "parsing_error": None,
+                "pdf_url": None,
+                "status": "error",
+                "error": "No PMCID provided"
+            }
         
-        items = []
+        # Clean PMCID format
+        clean_pmcid = pmcid.replace("PMC", "") if pmcid.startswith("PMC") else pmcid
+        full_pmcid = f"PMC{clean_pmcid}"
         
-        for pmcid in pmcids:
-            # Clean PMCID format
-            clean_pmcid = pmcid.replace("PMC", "") if pmcid.startswith("PMC") else pmcid
-            full_pmcid = f"PMC{clean_pmcid}"
+        try:
+            # Try to get JATS XML via efetch
+            fetch_params = {
+                "db": "pmc",
+                "id": full_pmcid,
+                "retmode": "xml"
+            }
+            
+            logger.info(f"Fetching full text for {full_pmcid}")
+            xml_response = await self._make_request(f"{NCBI_BASE_URL}/efetch.fcgi", fetch_params, method="POST")
+            
+            jats_xml = xml_response.text
+            
+            # Parse JATS XML to extract body text
+            parsed_body = self._parse_jats_body(jats_xml)
+            
+            # Try to get OA service info for PDF/supplementary files
+            oa_url = None
+            pdf_url = None
             
             try:
-                # Try to get JATS XML via efetch
-                fetch_params = {
-                    "db": "pmc",
-                    "id": full_pmcid,
-                    "retmode": "xml"
-                }
+                oa_params = {"id": full_pmcid}
+                oa_response = await self._make_request(PMC_OA_URL, oa_params)
+                oa_data = xmltodict.parse(oa_response.text)
                 
-                logger.info(f"Fetching full text for {full_pmcid}")
-                xml_response = await self._make_request(f"{NCBI_BASE_URL}/efetch.fcgi", fetch_params, method="POST")
-                
-                jats_xml = xml_response.text
-                
-                # Try to get OA service info for PDF/supplementary files
-                oa_url = None
-                pdf_url = None
-                
-                try:
-                    oa_params = {"id": full_pmcid}
-                    oa_response = await self._make_request(PMC_OA_URL, oa_params)
-                    oa_data = xmltodict.parse(oa_response.text)
-                    
-                    # Extract download links if available
-                    if "OA" in oa_data and "records" in oa_data["OA"]:
-                        record = oa_data["OA"]["records"].get("record")
-                        if record:
-                            links = record.get("link", [])
-                            if not isinstance(links, list):
-                                links = [links]
-                            
-                            for link in links:
-                                if link.get("@format") == "pdf":
-                                    pdf_url = link.get("@href")
-                                    break
-                
-                except Exception as e:
-                    logger.warning(f"Could not fetch OA info for {full_pmcid}: {e}")
-                
-                items.append({
-                    "pmcid": full_pmcid,
-                    "jats_xml": jats_xml,
-                    "pdf_url": pdf_url,
-                    "status": "success"
-                })
-                
+                # Extract download links if available
+                if "OA" in oa_data and "records" in oa_data["OA"]:
+                    record = oa_data["OA"]["records"].get("record")
+                    if record:
+                        links = record.get("link", [])
+                        if not isinstance(links, list):
+                            links = [links]
+                        
+                        for link in links:
+                            if link.get("@format") == "pdf":
+                                pdf_url = link.get("@href")
+                                break
+            
             except Exception as e:
-                logger.error(f"Failed to fetch full text for {full_pmcid}: {e}")
-                items.append({
-                    "pmcid": full_pmcid,
-                    "jats_xml": None,
-                    "pdf_url": None,
-                    "status": "error",
-                    "error": str(e)
-                })
-        
-        return items
+                logger.warning(f"Could not fetch OA info for {full_pmcid}: {e}")
+            
+            return {
+                "pmcid": full_pmcid,
+                "sections": parsed_body["sections"],
+                "parsing_error": parsed_body["error"],
+                "pdf_url": pdf_url,
+                "status": "success"
+            }
+            
+        except Exception as e:
+            logger.error(f"Failed to fetch full text for {full_pmcid}: {e}")
+            return {
+                "pmcid": full_pmcid,
+                "sections": [],
+                "parsing_error": None,
+                "pdf_url": None,
+                "status": "error",
+                "error": str(e)
+            }
 
 
 def create_server() -> FastMCP:
@@ -432,25 +704,37 @@ def create_server() -> FastMCP:
     mcp = FastMCP(name="PubMed MCP Server", instructions=server_instructions)
     
     @mcp.tool()
-    async def search(query: str) -> str:
+    async def search(query: str, retmax: int = 50, sort: str = "relevance") -> str:
         """
-        Search PubMed database with MeSH support.
-        
+        Search PubMed database with MeSH support and sorting options.
+
         Args:
             query: Search query string. Supports MeSH terms (e.g., "asthma[mh] AND adult[mh]")
-        
+            retmax: Maximum number of results to return (default: 50, max: 200)
+            sort: Sort order - "relevance" for Best Match (ML-based), "pub_date" for Most Recent (default: "relevance")
+
         Returns:
             JSON string containing search results with paper metadata
         """
         if not query or not query.strip():
             empty_result = {"results": []}
             return json.dumps(empty_result)
-        
+
+        # Validate and constrain retmax parameter
+        if retmax < 1:
+            retmax = 1
+        elif retmax > 200:
+            retmax = 200
+
+        # Validate sort parameter
+        if sort not in ["relevance", "pub_date"]:
+            raise ValueError(f"Invalid sort parameter: {sort}. Use 'relevance' for Best Match or 'pub_date' for Most Recent.")
+
         async with PubMedClient() as client:
             try:
                 # Use search with PMCID detection from esummary articleids
-                results = await client.search_pubmed(query, retmax=100, retstart=0)
-                logger.info(f"Search returned {len(results['items'])} results for query: {query}")
+                results = await client.search_pubmed(query, retmax=retmax, retstart=0, sort=sort)
+                logger.info(f"Search returned {len(results['items'])} of {retmax} requested results for query: {query} (sort: {sort})")
                 
                 # Transform to OpenAI MCP format with PMCID info
                 search_results = []
@@ -563,43 +847,103 @@ def create_server() -> FastMCP:
                 raise ValueError(f"Batch abstract retrieval failed: {str(e)}")
     
     @mcp.tool()
-    async def get_full_text(pmcids: List[str]) -> Dict[str, Any]:
+    async def get_full_text(pmcid: str) -> Dict[str, Any]:
         """
-        Retrieve full text content for PMCIDs.
-        
+        Retrieve full text content for a single PMCID.
+
         Args:
-            pmcids: List of PMC IDs (PMCIDs, with or without 'PMC' prefix)
-        
+            pmcid: PMC ID (PMCID, with or without 'PMC' prefix)
+
         Returns:
-            Dictionary with 'items' containing full text data and 'notes' about availability
+            Dictionary with sections array containing title and text for each section
         """
-        if not pmcids:
-            return {"items": [], "notes": []}
+        if not pmcid:
+            return {
+                "pmcid": None,
+                "sections": [],
+                "parsing_error": "No PMCID provided",
+                "pdf_url": None,
+                "status": "error",
+                "error": "No PMCID provided"
+            }
         
-        # Remove duplicates and clean PMCIDs
-        unique_pmcids = list(set(str(pmcid).strip() for pmcid in pmcids if str(pmcid).strip()))
+        # Clean PMCID format
+        clean_pmcid = str(pmcid).strip()
         
         async with PubMedClient() as client:
             try:
-                full_texts = await client.get_full_text(unique_pmcids)
+                result = await client.get_full_text(clean_pmcid)
+                logger.info(f"Retrieved full text for {result.get('pmcid', clean_pmcid)} - Status: {result.get('status')}")
                 
-                success_count = sum(1 for item in full_texts if item["status"] == "success")
-                logger.info(f"Retrieved {success_count} full texts for {len(unique_pmcids)} PMCIDs")
+                return result
                 
-                notes = [
-                    "Full text availability depends on PMC Open Access status",
-                    "JATS XML is provided when available",
-                    "PDF URLs are only available for Open Access articles"
-                ]
-                
-                return {
-                    "items": full_texts,
-                    "notes": notes
-                }
             except Exception as e:
-                logger.error(f"Full text retrieval failed: {e}")
-                raise ValueError(f"Full text retrieval failed: {str(e)}")
-    
+                logger.error(f"Full text retrieval failed for {clean_pmcid}: {e}")
+                return {
+                    "pmcid": clean_pmcid,
+                    "sections": [],
+                    "parsing_error": None,
+                    "pdf_url": None,
+                    "status": "error",
+                    "error": str(e)
+                }
+
+    @mcp.tool()
+    async def find_similar_articles(pmid: str, retmax: int = 20) -> Dict[str, Any]:
+        """
+        Find similar articles for a given PMID using PubMed's recommendation algorithm.
+
+        This tool uses NCBI's elink API to find articles that are computationally similar
+        to the reference article. The similarity is based on words from the title and
+        abstract, MeSH terms, and journal information.
+
+        Args:
+            pmid: PubMed ID of the reference article
+            retmax: Maximum number of similar articles to return (default: 20, max: 100)
+
+        Returns:
+            Dictionary containing similar articles with metadata including titles, authors,
+            journals, publication dates, and full-text availability
+        """
+        if not pmid or not pmid.strip():
+            return {
+                "reference_pmid": None,
+                "similar_articles": [],
+                "count": 0,
+                "error": "No PMID provided"
+            }
+
+        # Validate PMID format (basic check)
+        clean_pmid = pmid.strip()
+        if not clean_pmid.isdigit():
+            return {
+                "reference_pmid": clean_pmid,
+                "similar_articles": [],
+                "count": 0,
+                "error": "Invalid PMID format. PMID should be a numeric string."
+            }
+
+        # Validate and constrain retmax parameter
+        if retmax < 1:
+            retmax = 1
+        elif retmax > 100:
+            retmax = 100
+
+        async with PubMedClient() as client:
+            try:
+                result = await client.find_similar_articles(clean_pmid, retmax)
+                logger.info(f"Found {result['count']} similar articles for PMID: {clean_pmid}")
+                return result
+
+            except Exception as e:
+                logger.error(f"Similar articles search failed for PMID {clean_pmid}: {e}")
+                return {
+                    "reference_pmid": clean_pmid,
+                    "similar_articles": [],
+                    "count": 0,
+                    "error": str(e)
+                }
+
     @mcp.tool()
     async def count(query: str) -> str:
         """
@@ -643,40 +987,6 @@ def create_server() -> FastMCP:
                 logger.error(f"Count search failed: {e}")
                 raise ValueError(f"Count search failed: {str(e)}")
     
-    @mcp.tool()
-    async def count_batch(queries: List[str]) -> str:
-        """
-        Get counts for multiple search queries in a single batch.
-        
-        This tool efficiently checks the result counts for multiple queries,
-        useful for comparing different search strategies or testing variations.
-        
-        Args:
-            queries: List of search query strings
-        
-        Returns:
-            JSON string containing an array of count results for each query
-        
-        Example:
-            queries = [
-                "diabetes",
-                "diabetes[mh]",
-                "diabetes[majr]",
-                "diabetes[mh] AND clinical trial[pt]"
-            ]
-        """
-        if not queries:
-            return json.dumps([])
-        
-        async with PubMedClient() as client:
-            try:
-                results = await client.count_batch(queries)
-                logger.info(f"Batch count completed for {len(queries)} queries")
-                return json.dumps(results)
-                
-            except Exception as e:
-                logger.error(f"Batch count failed: {e}")
-                raise ValueError(f"Batch count failed: {str(e)}")
     
     return mcp
 

@@ -42,12 +42,12 @@ python test_server.py quick
 ### Core Server (`pubmed_mcp_server.py`)
 The main server implements six MCP tools:
 
-1. **search**: PubMed queries with MeSH support, returns up to 100 paper titles with PMCID info
-2. **fetch**: Single PMID abstract retrieval (OpenAI MCP compliant) 
+1. **search**: PubMed queries with MeSH support, returns configurable number of paper titles (1-200, default: 50) with PMCID info. Supports Best Match (relevance) and Most Recent (pub_date) sorting
+2. **fetch**: Single PMID abstract retrieval (OpenAI MCP compliant)
 3. **fetch_batch**: Multiple PMID abstract retrieval (efficient batch processing)
-4. **get_full_text**: PMC full-text retrieval (JATS XML and OA PDF URLs)
+4. **get_full_text**: PMC full-text retrieval (sections only)
 5. **count**: Get result count for query optimization (fast, no data retrieval)
-6. **count_batch**: Get counts for multiple queries (for comparing search strategies)
+6. **find_similar_articles**: Find similar articles using PubMed's recommendation algorithm
 
 ### Key Components
 
@@ -73,6 +73,7 @@ The main server implements six MCP tools:
 - `/esearch.fcgi` - Query PubMed database
 - `/esummary.fcgi` - Get paper metadata
 - `/efetch.fcgi` - Retrieve abstracts and full-text
+- `/elink.fcgi` - Find similar articles and citations
 - PMC OA Service - PDF/supplementary file URLs
 
 **Critical Compliance Points:**
@@ -107,3 +108,10 @@ The `fetch` tool specifically follows OpenAI MCP requirements:
 - Accepts single PMID only (no arrays)
 - Returns specific JSON structure with `id`, `title`, `text`, `url`, `metadata`
 - Separate `fetch_batch` tool for multiple PMIDs
+
+### Similar Articles Algorithm
+The `find_similar_articles` tool uses NCBI's elink API with `pubmed_pubmed` linkname:
+- Computational similarity based on title/abstract words, MeSH terms, journal info
+- Returns up to 100 similar articles with metadata
+- Includes full-text availability detection
+- Useful for literature review and related research discovery
