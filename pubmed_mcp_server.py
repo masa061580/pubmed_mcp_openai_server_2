@@ -20,6 +20,8 @@ from dotenv import load_dotenv
 from fastmcp import FastMCP
 from collections import deque
 
+from ris_exporter import RISExporter
+
 # Load environment variables
 load_dotenv()
 
@@ -71,7 +73,7 @@ rate_limiter = StrictRateLimiter(MAX_REQUESTS_PER_SECOND)
 
 # Server configuration
 server_instructions = """
-This MCP server provides PubMed/PMC research capabilities with six main tools:
+This MCP server provides PubMed/PMC research capabilities with seven main tools:
 
 1. search: PubMed queries with MeSH support, returning configurable number of paper titles (1-200, default: 50) with PMCID detection. Supports Best Match (relevance) and Most Recent (pub_date) sorting
 2. fetch: Retrieve abstract for a single PMID (OpenAI MCP compliant)
@@ -79,6 +81,7 @@ This MCP server provides PubMed/PMC research capabilities with six main tools:
 4. get_full_text: Retrieve full-text content for PMCIDs (sections only)
 5. count: Get result count for a query (for search optimization)
 6. find_similar_articles: Find similar articles using PubMed's recommendation algorithm
+7. export_to_ris: Export articles to RIS format for citation managers (EndNote/Zotero/Mendeley)
 
 All queries respect NCBI rate limits and usage policies.
 """
@@ -498,14 +501,22 @@ class PubMedClient:
                     lastname = author_elem.find("LastName")
                     if forename is not None and lastname is not None:
                         authors.append(f"{forename.text} {lastname.text}")
-                
+
+                # Extract DOI
+                doi = None
+                for article_id in article.findall(".//ArticleId"):
+                    if article_id.get("IdType") == "doi":
+                        doi = article_id.text
+                        break
+
                 items.append({
                     "pmid": pmid,
                     "title": title,
                     "abstract": abstract,
                     "journal": journal,
                     "year": year,
-                    "authors": authors
+                    "authors": authors,
+                    "doi": doi
                 })
             
             return items
@@ -948,21 +959,21 @@ def create_server() -> FastMCP:
     async def count(query: str) -> str:
         """
         Get only the count of search results for query adjustment and optimization.
-        
+
         This tool is designed for quickly checking how many papers match a query
         without retrieving the actual results. Useful for refining search strategies
         and testing different query combinations.
-        
+
         Args:
             query: Search query string. Supports MeSH terms and all PubMed search syntax.
-        
+
         Returns:
             JSON string containing:
             - query: The original query
             - count: Number of matching papers
             - query_translation: How PubMed interpreted the query (useful for debugging)
             - warnings: Any search warnings (e.g., ignored phrases)
-        
+
         Example queries:
             - "cancer" - Very broad search
             - "lung cancer[mh]" - MeSH term search
@@ -976,18 +987,71 @@ def create_server() -> FastMCP:
                 "query_translation": "",
                 "warnings": []
             })
-        
+
         async with PubMedClient() as client:
             try:
                 result = await client.count_search(query)
                 logger.info(f"Count for '{query}': {result['count']} results")
                 return json.dumps(result)
-                
+
             except Exception as e:
                 logger.error(f"Count search failed: {e}")
                 raise ValueError(f"Count search failed: {str(e)}")
-    
-    
+
+    @mcp.tool()
+    async def export_to_ris(pmids: List[str]) -> str:
+        """
+        Export PubMed articles to RIS format for citation managers (EndNote/Zotero/Mendeley).
+
+        Returns compact RIS format with minimal metadata (PMID, title, first author, journal, year, DOI).
+        Citation managers will auto-fetch complete metadata from PubMed using the PMID.
+
+        Args:
+            pmids: List of PubMed IDs (PMIDs) as strings
+
+        Returns:
+            RIS formatted text. Copy the output and save as .ris file for import.
+        """
+        if not pmids:
+            return "Error: No PMIDs provided"
+
+        # Remove duplicates and validate PMIDs
+        unique_pmids = list(set(str(pmid).strip() for pmid in pmids if str(pmid).strip()))
+
+        if not unique_pmids:
+            return "Error: No valid PMIDs provided"
+
+        async with PubMedClient() as client:
+            try:
+                # Fetch metadata for all PMIDs
+                abstracts = await client.get_abstracts(unique_pmids)
+
+                if not abstracts:
+                    return f"Error: Could not retrieve data for PMIDs: {', '.join(unique_pmids)}"
+
+                # Convert to RIS format
+                ris_text = RISExporter.export_multiple_to_ris(abstracts)
+
+                # Add user-friendly instructions
+                header = (
+                    f"📄 RIS Export Complete ({len(abstracts)} articles)\n\n"
+                    "Copy the text below and save as 'references.ris':\n\n"
+                    "```ris\n"
+                )
+                footer = (
+                    "```\n\n"
+                    "✅ Ready for import into EndNote/Zotero/Mendeley\n"
+                    "📝 Your citation manager will auto-fetch full metadata from PubMed using PMID"
+                )
+
+                logger.info(f"Exported {len(abstracts)} articles to RIS format")
+                return f"{header}{ris_text}{footer}"
+
+            except Exception as e:
+                logger.error(f"RIS export failed: {e}")
+                return f"Error: RIS export failed - {str(e)}"
+
+
     return mcp
 
 
