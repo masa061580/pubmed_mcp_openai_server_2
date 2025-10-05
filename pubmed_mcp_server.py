@@ -1032,16 +1032,18 @@ def create_server() -> FastMCP:
                 # Convert to RIS format
                 ris_text = RISExporter.export_multiple_to_ris(abstracts)
 
-                # Add user-friendly instructions
+                # Add user-friendly instructions with mandatory note
                 header = (
                     f"📄 RIS Export Complete ({len(abstracts)} articles)\n\n"
+                    "⚠️ IMPORTANT: This RIS file contains minimal metadata (PMID, title, first author only, journal, year, DOI).\n"
+                    "Please use your citation manager (EndNote/Zotero/Mendeley) to retrieve complete information from PubMed.\n\n"
                     "Copy the text below and save as 'references.ris':\n\n"
                     "```ris\n"
                 )
                 footer = (
                     "```\n\n"
                     "✅ Ready for import into EndNote/Zotero/Mendeley\n"
-                    "📝 Your citation manager will auto-fetch full metadata from PubMed using PMID"
+                    "📝 After import, use your citation manager's \"Update from PubMed\" feature to fetch full author lists and abstracts"
                 )
 
                 logger.info(f"Exported {len(abstracts)} articles to RIS format")
