@@ -35,6 +35,7 @@ NCBI_TOOL_NAME = os.getenv("NCBI_TOOL_NAME", "PubMedMCPServer")
 NCBI_EMAIL = os.getenv("NCBI_EMAIL", "pubmed.mcp.server@example.com")  # Default email if not provided
 NCBI_BASE_URL = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
 PMC_OA_URL = "https://www.ncbi.nlm.nih.gov/pmc/utils/oa/oa.fcgi"
+ICITE_API_URL = "https://icite.od.nih.gov/api/pubs"
 
 # Rate limiting - 10 req/s with API key, 3 req/s without
 MAX_REQUESTS_PER_SECOND = 10 if NCBI_API_KEY else 3
@@ -73,7 +74,7 @@ rate_limiter = StrictRateLimiter(MAX_REQUESTS_PER_SECOND)
 
 # Server configuration
 server_instructions = """
-This MCP server provides PubMed/PMC research capabilities with seven main tools:
+This MCP server provides PubMed/PMC research capabilities with eight main tools:
 
 1. search: PubMed queries with MeSH support, returning configurable number of paper titles (1-200, default: 50) with PMCID detection. Supports Best Match (relevance) and Most Recent (pub_date) sorting
 2. fetch: Retrieve abstract for a single PMID (OpenAI MCP compliant)
@@ -82,6 +83,7 @@ This MCP server provides PubMed/PMC research capabilities with seven main tools:
 5. count: Get result count for a query (for search optimization)
 6. find_similar_articles: Find similar articles using PubMed's recommendation algorithm
 7. export_to_ris: Export articles to RIS format for citation managers (EndNote/Zotero/Mendeley)
+8. get_citation_counts: Get citation counts for PMIDs using NIH iCite API (up to 1000 PMIDs per request)
 
 All queries respect NCBI rate limits and usage policies.
 """
@@ -633,11 +635,11 @@ class PubMedClient:
                 "status": "error",
                 "error": "No PMCID provided"
             }
-        
+
         # Clean PMCID format
         clean_pmcid = pmcid.replace("PMC", "") if pmcid.startswith("PMC") else pmcid
         full_pmcid = f"PMC{clean_pmcid}"
-        
+
         try:
             # Try to get JATS XML via efetch
             fetch_params = {
@@ -645,24 +647,24 @@ class PubMedClient:
                 "id": full_pmcid,
                 "retmode": "xml"
             }
-            
+
             logger.info(f"Fetching full text for {full_pmcid}")
             xml_response = await self._make_request(f"{NCBI_BASE_URL}/efetch.fcgi", fetch_params, method="POST")
-            
+
             jats_xml = xml_response.text
-            
+
             # Parse JATS XML to extract body text
             parsed_body = self._parse_jats_body(jats_xml)
-            
+
             # Try to get OA service info for PDF/supplementary files
             oa_url = None
             pdf_url = None
-            
+
             try:
                 oa_params = {"id": full_pmcid}
                 oa_response = await self._make_request(PMC_OA_URL, oa_params)
                 oa_data = xmltodict.parse(oa_response.text)
-                
+
                 # Extract download links if available
                 if "OA" in oa_data and "records" in oa_data["OA"]:
                     record = oa_data["OA"]["records"].get("record")
@@ -670,15 +672,15 @@ class PubMedClient:
                         links = record.get("link", [])
                         if not isinstance(links, list):
                             links = [links]
-                        
+
                         for link in links:
                             if link.get("@format") == "pdf":
                                 pdf_url = link.get("@href")
                                 break
-            
+
             except Exception as e:
                 logger.warning(f"Could not fetch OA info for {full_pmcid}: {e}")
-            
+
             return {
                 "pmcid": full_pmcid,
                 "sections": parsed_body["sections"],
@@ -686,7 +688,7 @@ class PubMedClient:
                 "pdf_url": pdf_url,
                 "status": "success"
             }
-            
+
         except Exception as e:
             logger.error(f"Failed to fetch full text for {full_pmcid}: {e}")
             return {
@@ -697,6 +699,66 @@ class PubMedClient:
                 "status": "error",
                 "error": str(e)
             }
+
+    async def get_citation_counts(self, pmids: List[str]) -> List[Dict[str, Any]]:
+        """Get citation counts for PMIDs using NIH iCite API
+
+        Args:
+            pmids: List of PubMed IDs (PMIDs)
+
+        Returns:
+            List of dictionaries containing PMID and citation_count only
+        """
+        if not pmids:
+            return []
+
+        # iCite API accepts up to 1000 PMIDs at once
+        pmids_str = ",".join(pmids[:1000])
+
+        try:
+            logger.info(f"Fetching citation counts for {len(pmids[:1000])} PMIDs from iCite")
+
+            # iCite API doesn't use NCBI rate limiter, so we make direct request
+            response = await self.session.get(
+                ICITE_API_URL,
+                params={"pmids": pmids_str, "format": "json"},
+                timeout=30.0
+            )
+            response.raise_for_status()
+            data = response.json()
+
+            # Extract only PMID and citation_count from response
+            results = []
+            for item in data.get("data", []):
+                pmid = str(item.get("pmid", ""))
+                citation_count = item.get("citation_count")
+
+                result = {"pmid": pmid}
+
+                if citation_count is not None:
+                    result["citation_count"] = citation_count
+                else:
+                    result["citation_count"] = None
+                    result["note"] = "Citation data not available"
+
+                results.append(result)
+
+            return results
+
+        except httpx.HTTPStatusError as e:
+            logger.error(f"iCite API HTTP error: {e}")
+            # Return error info for all PMIDs
+            return [
+                {"pmid": pmid, "citation_count": None, "error": f"HTTP error: {e.response.status_code}"}
+                for pmid in pmids
+            ]
+        except Exception as e:
+            logger.error(f"Failed to fetch citation counts: {e}")
+            # Return error info for all PMIDs
+            return [
+                {"pmid": pmid, "citation_count": None, "error": str(e)}
+                for pmid in pmids
+            ]
 
 
 def create_server() -> FastMCP:
@@ -1052,6 +1114,40 @@ def create_server() -> FastMCP:
             except Exception as e:
                 logger.error(f"RIS export failed: {e}")
                 return f"Error: RIS export failed - {str(e)}"
+
+    @mcp.tool()
+    async def get_citation_counts(pmids: List[str]) -> Dict[str, Any]:
+        """
+        Get citation counts for PMIDs using NIH iCite API.
+
+        This tool retrieves only the citation count for each PMID.
+        The iCite database provides citation data based on PubMed Central references.
+
+        Args:
+            pmids: List of PubMed IDs (PMIDs) as strings (max 1000 per request)
+
+        Returns:
+            Dictionary with items array containing pmid and citation_count
+            Example: {"items": [{"pmid": "12345678", "citation_count": 26}]}
+        """
+        if not pmids:
+            return {"items": []}
+
+        # Remove duplicates and validate PMIDs
+        unique_pmids = list(set(str(pmid).strip() for pmid in pmids if str(pmid).strip()))
+
+        if not unique_pmids:
+            return {"items": []}
+
+        async with PubMedClient() as client:
+            try:
+                results = await client.get_citation_counts(unique_pmids)
+                logger.info(f"Retrieved citation counts for {len(results)} PMIDs")
+                return {"items": results}
+
+            except Exception as e:
+                logger.error(f"Citation count retrieval failed: {e}")
+                raise ValueError(f"Citation count retrieval failed: {str(e)}")
 
 
     return mcp
