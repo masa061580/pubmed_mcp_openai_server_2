@@ -74,7 +74,7 @@ rate_limiter = StrictRateLimiter(MAX_REQUESTS_PER_SECOND)
 
 # Server configuration
 server_instructions = """
-This MCP server provides PubMed/PMC research capabilities with eight main tools:
+This MCP server provides PubMed/PMC research capabilities with nine main tools:
 
 1. search: PubMed queries with MeSH support, returning configurable number of paper titles (1-200, default: 50) with PMCID detection. Supports Best Match (relevance) and Most Recent (pub_date) sorting
 2. fetch: Retrieve abstract for a single PMID (OpenAI MCP compliant)
@@ -84,6 +84,7 @@ This MCP server provides PubMed/PMC research capabilities with eight main tools:
 6. find_similar_articles: Find similar articles using PubMed's recommendation algorithm
 7. export_to_ris: Export articles to RIS format for citation managers (EndNote/Zotero/Mendeley)
 8. get_citation_counts: Get citation counts for PMIDs using NIH iCite API (up to 1000 PMIDs per request)
+9. download_pdfs: Download PDF files for multiple PMCIDs with automatic redirect handling
 
 All queries respect NCBI rate limits and usage policies.
 """
@@ -760,6 +761,113 @@ class PubMedClient:
                 for pmid in pmids
             ]
 
+    async def download_pdfs_batch(self, pmcids: List[str], output_dir: str = ".") -> List[Dict[str, Any]]:
+        """Download PDFs for multiple PMCIDs with redirect handling
+
+        Args:
+            pmcids: List of PMC IDs (with or without 'PMC' prefix)
+            output_dir: Directory to save PDF files (default: current directory)
+
+        Returns:
+            List of dictionaries containing download status for each PMCID
+        """
+        if not pmcids:
+            return []
+
+        import os
+
+        # Create output directory if it doesn't exist
+        os.makedirs(output_dir, exist_ok=True)
+
+        results = []
+
+        for pmcid in pmcids:
+            # Clean PMCID format
+            clean_pmcid = pmcid.replace("PMC", "") if pmcid.startswith("PMC") else pmcid
+            full_pmcid = f"PMC{clean_pmcid}"
+
+            result = {
+                "pmcid": full_pmcid,
+                "status": "pending",
+                "file_path": None,
+                "error": None
+            }
+
+            try:
+                # Get PDF URL from OA service
+                oa_params = {"id": full_pmcid}
+                oa_response = await self._make_request(PMC_OA_URL, oa_params)
+                oa_data = xmltodict.parse(oa_response.text)
+
+                pdf_url = None
+                if "OA" in oa_data and "records" in oa_data["OA"]:
+                    record = oa_data["OA"]["records"].get("record")
+                    if record:
+                        links = record.get("link", [])
+                        if not isinstance(links, list):
+                            links = [links]
+
+                        for link in links:
+                            if link.get("@format") == "pdf":
+                                pdf_url = link.get("@href")
+                                break
+
+                if not pdf_url:
+                    result["status"] = "no_pdf"
+                    result["error"] = "PDF not available (not Open Access or publisher restrictions)"
+                    results.append(result)
+                    logger.warning(f"No PDF URL found for {full_pmcid}")
+                    continue
+
+                # Convert FTP URLs to HTTP URLs (PMC often returns FTP URLs but HTTP works)
+                if pdf_url.startswith("ftp://ftp.ncbi.nlm.nih.gov/"):
+                    pdf_url = pdf_url.replace("ftp://ftp.ncbi.nlm.nih.gov/", "https://ftp.ncbi.nlm.nih.gov/")
+                    logger.info(f"Converted FTP URL to HTTPS: {pdf_url}")
+
+                # Download PDF with redirect handling
+                logger.info(f"Downloading PDF for {full_pmcid} from {pdf_url}")
+
+                # Use follow_redirects=True to handle redirects automatically
+                pdf_response = await self.session.get(
+                    pdf_url,
+                    follow_redirects=True,
+                    timeout=60.0
+                )
+                pdf_response.raise_for_status()
+
+                # Check if response is actually PDF
+                content_type = pdf_response.headers.get("content-type", "")
+                if "pdf" not in content_type.lower():
+                    result["status"] = "error"
+                    result["error"] = f"Response is not PDF (content-type: {content_type})"
+                    results.append(result)
+                    logger.error(f"Response for {full_pmcid} is not PDF: {content_type}")
+                    continue
+
+                # Save PDF to file
+                file_path = os.path.join(output_dir, f"{full_pmcid}.pdf")
+                with open(file_path, "wb") as f:
+                    f.write(pdf_response.content)
+
+                result["status"] = "success"
+                result["file_path"] = file_path
+                result["file_size"] = len(pdf_response.content)
+                results.append(result)
+                logger.info(f"Successfully downloaded PDF for {full_pmcid} to {file_path} ({len(pdf_response.content)} bytes)")
+
+            except httpx.HTTPStatusError as e:
+                result["status"] = "error"
+                result["error"] = f"HTTP error {e.response.status_code}: {e.response.reason_phrase}"
+                results.append(result)
+                logger.error(f"HTTP error downloading PDF for {full_pmcid}: {e}")
+            except Exception as e:
+                result["status"] = "error"
+                result["error"] = str(e)
+                results.append(result)
+                logger.error(f"Failed to download PDF for {full_pmcid}: {e}")
+
+        return results
+
 
 def create_server() -> FastMCP:
     """Create and configure the MCP server"""
@@ -1148,6 +1256,81 @@ def create_server() -> FastMCP:
             except Exception as e:
                 logger.error(f"Citation count retrieval failed: {e}")
                 raise ValueError(f"Citation count retrieval failed: {str(e)}")
+
+    @mcp.tool()
+    async def download_pdfs(pmcids: List[str], output_dir: str = "pdfs") -> Dict[str, Any]:
+        """
+        Download PDF files for multiple PMCIDs with automatic redirect handling.
+
+        This tool downloads Open Access PDF files from PubMed Central.
+        PDFs are only available for Open Access articles. Non-OA articles will
+        return a "no_pdf" status.
+
+        Args:
+            pmcids: List of PMC IDs (with or without 'PMC' prefix)
+            output_dir: Directory to save PDF files (default: "pdfs")
+
+        Returns:
+            Dictionary with items array containing download status for each PMCID
+            Example: {
+                "items": [
+                    {
+                        "pmcid": "PMC8234567",
+                        "status": "success",
+                        "file_path": "pdfs/PMC8234567.pdf",
+                        "file_size": 1234567
+                    },
+                    {
+                        "pmcid": "PMC9876543",
+                        "status": "no_pdf",
+                        "error": "PDF not available (not Open Access or publisher restrictions)"
+                    }
+                ],
+                "summary": {
+                    "total": 2,
+                    "success": 1,
+                    "failed": 0,
+                    "no_pdf": 1
+                }
+            }
+        """
+        if not pmcids:
+            return {
+                "items": [],
+                "summary": {"total": 0, "success": 0, "failed": 0, "no_pdf": 0}
+            }
+
+        # Remove duplicates and validate PMCIDs
+        unique_pmcids = list(set(str(pmcid).strip() for pmcid in pmcids if str(pmcid).strip()))
+
+        if not unique_pmcids:
+            return {
+                "items": [],
+                "summary": {"total": 0, "success": 0, "failed": 0, "no_pdf": 0}
+            }
+
+        async with PubMedClient() as client:
+            try:
+                results = await client.download_pdfs_batch(unique_pmcids, output_dir)
+
+                # Calculate summary
+                summary = {
+                    "total": len(results),
+                    "success": sum(1 for r in results if r["status"] == "success"),
+                    "failed": sum(1 for r in results if r["status"] == "error"),
+                    "no_pdf": sum(1 for r in results if r["status"] == "no_pdf")
+                }
+
+                logger.info(f"PDF download complete: {summary['success']}/{summary['total']} successful")
+
+                return {
+                    "items": results,
+                    "summary": summary
+                }
+
+            except Exception as e:
+                logger.error(f"PDF download batch failed: {e}")
+                raise ValueError(f"PDF download batch failed: {str(e)}")
 
 
     return mcp
